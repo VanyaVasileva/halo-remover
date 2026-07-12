@@ -175,18 +175,20 @@ def process_background_removal(
 
 
 
+
 def process_existing_png(
     image: Image.Image,
     mode: str,
     strength: str,
     halo_width: int,
+    solid_fringe_cleanup: bool,
 ) -> Image.Image:
     """
-    Clean a halo only in a narrow band along the transparent outer edge.
+    Halo cleanup for transparent PNG artwork.
 
-    Instead of merely lowering alpha (which can create a gray fringe),
-    the function borrows color from the nearest more-opaque interior pixel.
-    This preserves pale interior artwork and avoids a dark/gray outline.
+    The cleanup is restricted to a narrow band along the transparent exterior.
+    It can also repair opaque white/gray fringe pixels by replacing their RGB
+    values with colors borrowed from clean pixels farther inside the motif.
     """
     rgba = np.array(pil_to_rgba(image), dtype=np.uint8)
     rgb = rgba[..., :3].astype(np.float32)
@@ -200,90 +202,113 @@ def process_existing_png(
     }
     s = strength_map[strength]
 
-    if s == 0.0:
+    if s == 0.0 or not np.any(alpha > 1):
         return Image.fromarray(rgba, mode="RGBA")
 
-    # Transparent exterior and visible foreground.
-    transparent = alpha <= 1
-    foreground = alpha > 1
+    visible = alpha > 1
 
-    if not np.any(foreground):
-        return Image.fromarray(rgba, mode="RGBA")
+    # Distance measured inward from the transparent exterior.
+    distance_inside = ndimage.distance_transform_edt(visible)
+    edge_band = visible & (distance_inside <= max(1, int(halo_width)))
 
-    # Build a narrow band just inside the visible object boundary.
-    distance_inside = ndimage.distance_transform_edt(foreground)
-    edge_band = foreground & (distance_inside <= max(1, int(halo_width)))
+    # Use pixels farther inside the motif as clean color references.
+    interior_distance = max(2, int(halo_width) + 2)
+    clean_interior = visible & (distance_inside >= interior_distance) & (alpha >= 120)
 
-    # Strong interior pixels provide clean replacement colors.
-    interior_seed = alpha >= 220
-    if not np.any(interior_seed):
-        interior_seed = alpha >= 128
-    if not np.any(interior_seed):
-        interior_seed = foreground
+    if not np.any(clean_interior):
+        clean_interior = visible & (distance_inside >= max(2, int(halo_width) + 1))
 
-    # Find nearest clean interior pixel for every location.
-    _, nearest_indices = ndimage.distance_transform_edt(
-        ~interior_seed,
+    if not np.any(clean_interior):
+        clean_interior = visible & (alpha >= 180)
+
+    if not np.any(clean_interior):
+        clean_interior = visible
+
+    # Nearest clean interior RGB for each pixel.
+    _, nearest = ndimage.distance_transform_edt(
+        ~clean_interior,
         return_indices=True,
     )
-    nearest_y = nearest_indices[0]
-    nearest_x = nearest_indices[1]
-    inner_rgb = rgb[nearest_y, nearest_x]
+    inner_rgb = rgb[nearest[0], nearest[1]]
 
-    # Estimate whether an edge pixel looks contaminated.
-    max_c = rgb.max(axis=2)
-    min_c = rgb.min(axis=2)
-    saturation = max_c - min_c
     brightness = rgb.mean(axis=2)
+    saturation = rgb.max(axis=2) - rgb.min(axis=2)
+
+    inner_brightness = inner_rgb.mean(axis=2)
+    rgb_difference = np.sqrt(np.sum((rgb - inner_rgb) ** 2, axis=2))
 
     if mode == "Light halo":
-        # Bright, low-saturation edge pixels are most suspicious.
-        contamination = np.clip((brightness - 150.0) / 105.0, 0.0, 1.0)
-        contamination *= np.clip((70.0 - saturation) / 70.0, 0.0, 1.0)
+        halo_likeness = np.clip((brightness - 125.0) / 130.0, 0.0, 1.0)
+        halo_likeness *= np.clip((95.0 - saturation) / 95.0, 0.0, 1.0)
+
+        # A suspicious light fringe is notably brighter than the nearby motif.
+        relative_difference = np.clip(
+            (brightness - inner_brightness - 4.0) / 55.0,
+            0.0,
+            1.0,
+        )
     else:
-        # Dark, low-saturation edge pixels are suspicious for dark halos.
-        contamination = np.clip((105.0 - brightness) / 105.0, 0.0, 1.0)
-        contamination *= np.clip((70.0 - saturation) / 70.0, 0.0, 1.0)
+        halo_likeness = np.clip((130.0 - brightness) / 130.0, 0.0, 1.0)
+        halo_likeness *= np.clip((95.0 - saturation) / 95.0, 0.0, 1.0)
 
-    # Semi-transparent pixels are more likely to contain old background color.
+        # A suspicious dark fringe is notably darker than the nearby motif.
+        relative_difference = np.clip(
+            (inner_brightness - brightness - 4.0) / 55.0,
+            0.0,
+            1.0,
+        )
+
+    color_mismatch = np.clip((rgb_difference - 5.0) / 70.0, 0.0, 1.0)
+
+    # Semi-transparent fringe pixels receive more cleanup, but fully opaque
+    # fringe pixels can also be repaired when solid fringe cleanup is enabled.
     transparency_weight = np.clip((255.0 - alpha) / 180.0, 0.0, 1.0)
-    replace_weight = edge_band.astype(np.float32) * contamination
-    replace_weight *= (0.35 + 0.65 * transparency_weight) * s
-    replace_weight = np.clip(replace_weight, 0.0, 1.0)[..., None]
+    opacity_factor = 0.25 + 0.75 * transparency_weight
 
-    # Reconstruct edge RGB using nearby genuine motif color.
-    cleaned_rgb = rgb * (1.0 - replace_weight) + inner_rgb * replace_weight
+    if solid_fringe_cleanup:
+        opacity_factor = np.maximum(opacity_factor, 0.70)
 
-    # Remove only extremely weak outer pixels.
-    # This avoids turning a white halo into a gray semi-transparent line.
-    outside_distance = ndimage.distance_transform_edt(~transparent)
-    outermost = foreground & (outside_distance <= 1.5)
+    weight = (
+        edge_band.astype(np.float32)
+        * halo_likeness
+        * np.maximum(relative_difference, 0.35 * color_mismatch)
+        * opacity_factor
+        * s
+    )
+    weight = np.clip(weight, 0.0, 1.0)
 
+    cleaned_rgb = rgb * (1.0 - weight[..., None]) + inner_rgb * weight[..., None]
+
+    # Clean only the very weakest contaminated outer pixels.
+    outermost = visible & (distance_inside <= 1.15)
     weak_limit = {
-        "Gentle": 5,
-        "Medium": 12,
-        "Strong": 22,
+        "Gentle": 4,
+        "Medium": 10,
+        "Strong": 20,
     }[strength]
 
-    weak_pixels = outermost & (alpha <= weak_limit)
-    alpha[weak_pixels] = 0.0
+    very_weak = outermost & (alpha <= weak_limit) & (halo_likeness > 0.45)
+    alpha[very_weak] = 0.0
 
-    # For stronger cleanup, gently reduce only low-alpha contaminated pixels.
-    if strength in ("Medium", "Strong"):
-        soft_candidates = edge_band & (alpha < 90) & (contamination > 0.45)
-        reduction = 0.80 if strength == "Medium" else 0.60
-        alpha[soft_candidates] *= reduction
+    # Strong mode can gently reduce alpha on clearly contaminated low-alpha pixels.
+    if strength == "Strong":
+        low_alpha_contaminated = (
+            edge_band
+            & (alpha < 75)
+            & (halo_likeness > 0.60)
+            & (relative_difference > 0.30)
+        )
+        alpha[low_alpha_contaminated] *= 0.72
 
-    # Fully transparent pixels get neutral RGB values to avoid export fringes.
     cleaned_rgb[alpha <= 0] = 0
 
-    out = np.dstack(
+    result = np.dstack(
         [
             np.clip(cleaned_rgb, 0, 255).astype(np.uint8),
             np.clip(alpha, 0, 255).astype(np.uint8),
         ]
     )
-    return Image.fromarray(out, mode="RGBA")
+    return Image.fromarray(result, mode="RGBA")
 
 
 
@@ -400,9 +425,15 @@ else:
     halo_width = st.sidebar.slider(
         "Halo width",
         min_value=1,
-        max_value=4,
+        max_value=5,
         value=2,
         help="Width of the outer edge band to clean. Start with 2 px.",
+    )
+
+    solid_fringe_cleanup = st.sidebar.checkbox(
+        "Repair solid white/gray fringe",
+        value=True,
+        help="Also repairs opaque fringe pixels, not only semi-transparent ones.",
     )
 
 
@@ -438,6 +469,7 @@ for uploaded in uploaded_files:
                 mode=halo_mode,
                 strength=halo_strength,
                 halo_width=halo_width,
+                solid_fringe_cleanup=solid_fringe_cleanup,
             )
 
         output_name = f"{Path(uploaded.name).stem}_clean.png"
