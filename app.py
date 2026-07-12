@@ -174,66 +174,117 @@ def process_background_removal(
     return Image.fromarray(out, mode="RGBA")
 
 
+
 def process_existing_png(
     image: Image.Image,
     mode: str,
     strength: str,
-    edge_trim_px: int,
+    halo_width: int,
 ) -> Image.Image:
+    """
+    Clean a halo only in a narrow band along the transparent outer edge.
+
+    Instead of merely lowering alpha (which can create a gray fringe),
+    the function borrows color from the nearest more-opaque interior pixel.
+    This preserves pale interior artwork and avoids a dark/gray outline.
+    """
     rgba = np.array(pil_to_rgba(image), dtype=np.uint8)
     rgb = rgba[..., :3].astype(np.float32)
     alpha = rgba[..., 3].astype(np.float32)
 
     strength_map = {
         "Off": 0.0,
-        "Gentle": 0.25,
-        "Medium": 0.50,
-        "Strong": 0.75,
+        "Gentle": 0.35,
+        "Medium": 0.65,
+        "Strong": 1.0,
     }
     s = strength_map[strength]
 
     if s == 0.0:
         return Image.fromarray(rgba, mode="RGBA")
 
-    edge = (alpha > 0) & (alpha < 250)
-    edge_band = ndimage.binary_dilation(edge, iterations=1)
+    # Transparent exterior and visible foreground.
+    transparent = alpha <= 1
+    foreground = alpha > 1
+
+    if not np.any(foreground):
+        return Image.fromarray(rgba, mode="RGBA")
+
+    # Build a narrow band just inside the visible object boundary.
+    distance_inside = ndimage.distance_transform_edt(foreground)
+    edge_band = foreground & (distance_inside <= max(1, int(halo_width)))
+
+    # Strong interior pixels provide clean replacement colors.
+    interior_seed = alpha >= 220
+    if not np.any(interior_seed):
+        interior_seed = alpha >= 128
+    if not np.any(interior_seed):
+        interior_seed = foreground
+
+    # Find nearest clean interior pixel for every location.
+    _, nearest_indices = ndimage.distance_transform_edt(
+        ~interior_seed,
+        return_indices=True,
+    )
+    nearest_y = nearest_indices[0]
+    nearest_x = nearest_indices[1]
+    inner_rgb = rgb[nearest_y, nearest_x]
+
+    # Estimate whether an edge pixel looks contaminated.
+    max_c = rgb.max(axis=2)
+    min_c = rgb.min(axis=2)
+    saturation = max_c - min_c
+    brightness = rgb.mean(axis=2)
 
     if mode == "Light halo":
-        target = np.full((1, 1, 3), 255.0, dtype=np.float32)
+        # Bright, low-saturation edge pixels are most suspicious.
+        contamination = np.clip((brightness - 150.0) / 105.0, 0.0, 1.0)
+        contamination *= np.clip((70.0 - saturation) / 70.0, 0.0, 1.0)
     else:
-        # Conservative dark neutral target.
-        target = np.full((1, 1, 3), 32.0, dtype=np.float32)
+        # Dark, low-saturation edge pixels are suspicious for dark halos.
+        contamination = np.clip((105.0 - brightness) / 105.0, 0.0, 1.0)
+        contamination *= np.clip((70.0 - saturation) / 70.0, 0.0, 1.0)
 
-    a = np.clip(alpha / 255.0, 0.0, 1.0)
-    safe_a = np.maximum(a, 0.08)[..., None]
-    recovered = (rgb - (1.0 - a[..., None]) * target) / safe_a
-    recovered = np.clip(recovered, 0, 255)
+    # Semi-transparent pixels are more likely to contain old background color.
+    transparency_weight = np.clip((255.0 - alpha) / 180.0, 0.0, 1.0)
+    replace_weight = edge_band.astype(np.float32) * contamination
+    replace_weight *= (0.35 + 0.65 * transparency_weight) * s
+    replace_weight = np.clip(replace_weight, 0.0, 1.0)[..., None]
 
-    weight = (edge_band.astype(np.float32) * (1.0 - a) * s)[..., None]
-    rgb = rgb * (1.0 - weight) + recovered * weight
+    # Reconstruct edge RGB using nearby genuine motif color.
+    cleaned_rgb = rgb * (1.0 - replace_weight) + inner_rgb * replace_weight
 
-    # Gentle cleanup of extremely weak exterior pixels.
-    weak = (alpha > 0) & (alpha < (10 + 25 * s))
-    weak_outside = connected_to_border(weak | (alpha == 0)) & weak
-    alpha[weak_outside] *= max(0.0, 1.0 - 0.65 * s)
+    # Remove only extremely weak outer pixels.
+    # This avoids turning a white halo into a gray semi-transparent line.
+    outside_distance = ndimage.distance_transform_edt(~transparent)
+    outermost = foreground & (outside_distance <= 1.5)
 
-    if edge_trim_px > 0:
-        fg = alpha > 2
-        eroded = ndimage.binary_erosion(
-            fg,
-            structure=np.ones((3, 3), dtype=bool),
-            iterations=edge_trim_px,
-            border_value=0,
-        )
-        alpha[~eroded] *= 0.35
+    weak_limit = {
+        "Gentle": 5,
+        "Medium": 12,
+        "Strong": 22,
+    }[strength]
+
+    weak_pixels = outermost & (alpha <= weak_limit)
+    alpha[weak_pixels] = 0.0
+
+    # For stronger cleanup, gently reduce only low-alpha contaminated pixels.
+    if strength in ("Medium", "Strong"):
+        soft_candidates = edge_band & (alpha < 90) & (contamination > 0.45)
+        reduction = 0.80 if strength == "Medium" else 0.60
+        alpha[soft_candidates] *= reduction
+
+    # Fully transparent pixels get neutral RGB values to avoid export fringes.
+    cleaned_rgb[alpha <= 0] = 0
 
     out = np.dstack(
         [
-            np.clip(rgb, 0, 255).astype(np.uint8),
+            np.clip(cleaned_rgb, 0, 255).astype(np.uint8),
             np.clip(alpha, 0, 255).astype(np.uint8),
         ]
     )
     return Image.fromarray(out, mode="RGBA")
+
 
 
 def composite_on_background(image: Image.Image, color: str) -> Image.Image:
@@ -346,11 +397,12 @@ else:
         value="Gentle",
     )
 
-    edge_trim_px = st.sidebar.slider(
-        "Optional edge trim",
-        min_value=0,
-        max_value=2,
-        value=0,
+    halo_width = st.sidebar.slider(
+        "Halo width",
+        min_value=1,
+        max_value=4,
+        value=2,
+        help="Width of the outer edge band to clean. Start with 2 px.",
     )
 
 
@@ -385,7 +437,7 @@ for uploaded in uploaded_files:
                 image=source,
                 mode=halo_mode,
                 strength=halo_strength,
-                edge_trim_px=edge_trim_px,
+                halo_width=halo_width,
             )
 
         output_name = f"{Path(uploaded.name).stem}_clean.png"
