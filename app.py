@@ -1,24 +1,24 @@
 
 import io
+import zipfile
 from pathlib import Path
 
 import numpy as np
 import streamlit as st
 from PIL import Image, ImageColor, ImageOps
 from scipy import ndimage
-from streamlit_drawable_canvas import st_canvas
 
 
 st.set_page_config(
     page_title="Halo Studio",
-    page_icon="🪄",
+    page_icon="✨",
     layout="wide",
 )
 
 st.title("Halo Studio")
 st.caption(
-    "Male grob über den störenden Rand. Der Brush verändert nur eine schmale Zone "
-    "direkt an der transparenten Außenkante."
+    "Color decontamination for transparent watercolor and clipart PNGs. "
+    "The alpha channel is preserved unless weak-pixel cleanup is enabled."
 )
 
 
@@ -26,13 +26,13 @@ def open_rgba(image: Image.Image) -> Image.Image:
     return ImageOps.exif_transpose(image).convert("RGBA")
 
 
-def png_bytes(image: Image.Image) -> bytes:
+def image_to_png_bytes(image: Image.Image) -> bytes:
     buffer = io.BytesIO()
     image.save(buffer, format="PNG", optimize=False)
     return buffer.getvalue()
 
 
-def composite(image: Image.Image, color: str) -> Image.Image:
+def composite_on_color(image: Image.Image, color: str) -> Image.Image:
     rgba = open_rgba(image)
     background = Image.new(
         "RGBA",
@@ -42,30 +42,10 @@ def composite(image: Image.Image, color: str) -> Image.Image:
     return Image.alpha_composite(background, rgba).convert("RGB")
 
 
-def resize_for_editor(
-    image: Image.Image,
-    max_width: int = 1000,
-    max_height: int = 720,
-) -> tuple[Image.Image, float]:
-    width, height = image.size
-    scale = min(max_width / width, max_height / height, 1.0)
-
-    new_width = max(1, int(round(width * scale)))
-    new_height = max(1, int(round(height * scale)))
-
-    resized = image.resize(
-        (new_width, new_height),
-        Image.Resampling.LANCZOS,
-    )
-    return resized, scale
-
-
-def build_edge_zone(alpha: np.ndarray, width: int) -> np.ndarray:
+def make_edge_band(alpha: np.ndarray, width: int) -> np.ndarray:
     visible = alpha > 0
-
     if not np.any(visible):
         return visible
-
     distance_inside = ndimage.distance_transform_edt(visible)
     return visible & (distance_inside <= max(1, int(width)))
 
@@ -81,17 +61,13 @@ def nearest_interior_rgb(
     seed = (
         visible
         & (distance_inside >= max(3, edge_width + 2))
-        & (alpha >= 170)
+        & (alpha >= 180)
     )
 
     if not np.any(seed):
-        seed = visible & (
-            distance_inside >= max(2, edge_width + 1)
-        )
-
+        seed = visible & (distance_inside >= max(2, edge_width + 1))
     if not np.any(seed):
         seed = visible & (alpha >= 220)
-
     if not np.any(seed):
         seed = visible
 
@@ -99,90 +75,159 @@ def nearest_interior_rgb(
         ~seed,
         return_indices=True,
     )
-
     return rgb[nearest[0], nearest[1]]
 
 
-def extract_brush_mask(
-    canvas_rgba: np.ndarray | None,
-    original_size: tuple[int, int],
+def exact_decontamination(
+    rgb: np.ndarray,
+    alpha: np.ndarray,
+    former_bg: np.ndarray,
+    mask: np.ndarray,
+    strength: float,
 ) -> np.ndarray:
     """
-    The brush is bright magenta. Detect only those painted pixels,
-    then resize the mask back to the original PNG dimensions.
+    Recover foreground color F from:
+        observed = alpha * F + (1-alpha) * background
+
+    Applied only to semi-transparent pixels in the selected edge band.
     """
-    width, height = original_size
+    a = np.clip(alpha / 255.0, 0.0, 1.0)
+    safe_a = np.maximum(a, 0.035)[..., None]
+    bg = former_bg.reshape(1, 1, 3).astype(np.float32)
 
-    if canvas_rgba is None:
-        return np.zeros((height, width), dtype=bool)
+    recovered = (rgb - (1.0 - a[..., None]) * bg) / safe_a
+    recovered = np.clip(recovered, 0.0, 255.0)
 
-    data = np.asarray(canvas_rgba)
+    partial = mask & (alpha > 0) & (alpha < 255)
+    weight = (
+        partial.astype(np.float32)
+        * np.clip((255.0 - alpha) / 210.0, 0.0, 1.0)
+        * strength
+    )[..., None]
 
-    red = data[..., 0]
-    green = data[..., 1]
-    blue = data[..., 2]
-    alpha = data[..., 3]
-
-    magenta = (
-        (red >= 210)
-        & (blue >= 210)
-        & (green <= 120)
-        & (alpha >= 80)
-    )
-
-    mask_image = Image.fromarray(
-        (magenta.astype(np.uint8) * 255),
-        mode="L",
-    )
-    mask_image = mask_image.resize(
-        original_size,
-        Image.Resampling.NEAREST,
-    )
-
-    return np.asarray(mask_image) > 0
+    return rgb * (1.0 - weight) + recovered * weight
 
 
-def apply_halo_brush(
-    image: Image.Image,
-    brush_mask: np.ndarray,
-    edge_width: int,
+def repair_opaque_fringe(
+    rgb: np.ndarray,
+    alpha: np.ndarray,
+    former_bg: np.ndarray,
+    edge_band: np.ndarray,
+    inner_rgb: np.ndarray,
     strength: float,
-    remove_outer_ring: bool,
+    tolerance: float,
+) -> np.ndarray:
+    """
+    Repair opaque fringe pixels only when they are:
+    - in the narrow outer edge band,
+    - close to the former background color,
+    - visibly different from nearby interior motif color.
+    """
+    bg = former_bg.reshape(1, 1, 3).astype(np.float32)
+
+    distance_to_bg = np.sqrt(np.sum((rgb - bg) ** 2, axis=2))
+    distance_to_inner = np.sqrt(np.sum((rgb - inner_rgb) ** 2, axis=2))
+
+    near_background = np.clip(
+        1.0 - distance_to_bg / max(1.0, tolerance),
+        0.0,
+        1.0,
+    )
+
+    differs_from_inner = np.clip(
+        (distance_to_inner - 3.0) / 52.0,
+        0.0,
+        1.0,
+    )
+
+    opaque_or_nearly = np.clip((alpha - 170.0) / 85.0, 0.0, 1.0)
+
+    weight = (
+        edge_band.astype(np.float32)
+        * near_background
+        * differs_from_inner
+        * opaque_or_nearly
+        * strength
+    )
+    weight = np.clip(weight, 0.0, 1.0)[..., None]
+
+    return rgb * (1.0 - weight) + inner_rgb * weight
+
+
+def remove_weak_outer_pixels(
+    alpha: np.ndarray,
+    edge_band: np.ndarray,
+    strength: float,
+) -> np.ndarray:
+    cleaned = alpha.copy()
+    threshold = int(round(3 + 18 * strength))
+    weak = edge_band & (cleaned > 0) & (cleaned <= threshold)
+    cleaned[weak] = 0
+    return cleaned
+
+
+def process_image(
+    image: Image.Image,
+    former_background_hex: str,
+    cleanup_strength: str,
+    edge_width: int,
+    repair_opaque: bool,
+    remove_weak: bool,
 ) -> Image.Image:
     rgba = np.array(open_rgba(image), dtype=np.uint8)
 
     rgb = rgba[..., :3].astype(np.float32)
     alpha = rgba[..., 3].astype(np.float32)
 
-    edge_zone = build_edge_zone(alpha, edge_width)
-    active = edge_zone & brush_mask
+    strength_map = {
+        "Off": 0.0,
+        "Gentle": 0.45,
+        "Medium": 0.75,
+        "Strong": 1.0,
+    }
+    strength = strength_map[cleanup_strength]
 
-    if not np.any(active):
+    if strength == 0.0 or not np.any(alpha > 0):
         return Image.fromarray(rgba, mode="RGBA")
 
-    interior_rgb = nearest_interior_rgb(
+    former_bg = np.array(
+        ImageColor.getrgb(former_background_hex),
+        dtype=np.float32,
+    )
+
+    edge_band = make_edge_band(alpha, edge_width)
+
+    # 1. Exact decontamination of semi-transparent edge pixels.
+    rgb = exact_decontamination(
         rgb=rgb,
         alpha=alpha,
-        edge_width=edge_width,
+        former_bg=former_bg,
+        mask=edge_band,
+        strength=strength,
     )
 
-    rgb[active] = (
-        rgb[active] * (1.0 - strength)
-        + interior_rgb[active] * strength
-    )
-
-    if remove_outer_ring:
-        visible = alpha > 0
-        distance_inside = ndimage.distance_transform_edt(visible)
-
-        outer_ring = (
-            visible
-            & (distance_inside <= 1.05)
-            & brush_mask
+    # 2. Optional repair of solid fringe pixels.
+    if repair_opaque:
+        interior_rgb = nearest_interior_rgb(rgb, alpha, edge_width)
+        rgb = repair_opaque_fringe(
+            rgb=rgb,
+            alpha=alpha,
+            former_bg=former_bg,
+            edge_band=edge_band,
+            inner_rgb=interior_rgb,
+            strength=strength,
+            tolerance=150.0,
         )
 
-        alpha[outer_ring] = 0.0
+    # 3. Optional deletion of only nearly invisible outer remnants.
+    if remove_weak:
+        alpha = remove_weak_outer_pixels(
+            alpha=alpha,
+            edge_band=edge_band,
+            strength=strength,
+        )
 
+    # Hidden RGB values in fully transparent pixels can create export fringes.
     rgb[alpha <= 0] = 0
 
     output = np.dstack(
@@ -191,71 +236,56 @@ def apply_halo_brush(
             np.clip(alpha, 0, 255).astype(np.uint8),
         ]
     )
-
     return Image.fromarray(output, mode="RGBA")
 
 
-def restore_brush(
-    edited: Image.Image,
-    original: Image.Image,
-    brush_mask: np.ndarray,
-) -> Image.Image:
-    edited_array = np.array(open_rgba(edited), dtype=np.uint8)
-    original_array = np.array(open_rgba(original), dtype=np.uint8)
-
-    edited_array[brush_mask] = original_array[brush_mask]
-
-    return Image.fromarray(edited_array, mode="RGBA")
+def alpha_preview(image: Image.Image) -> Image.Image:
+    alpha = np.array(open_rgba(image), dtype=np.uint8)[..., 3]
+    return Image.fromarray(alpha, mode="L")
 
 
-st.sidebar.header("Brush-Einstellungen")
+def edge_preview(image: Image.Image, width: int) -> Image.Image:
+    alpha = np.array(open_rgba(image), dtype=np.uint8)[..., 3]
+    edge = make_edge_band(alpha.astype(np.float32), width)
+    preview = np.zeros((*edge.shape, 3), dtype=np.uint8)
+    preview[edge] = 255
+    return Image.fromarray(preview, mode="RGB")
 
-tool = st.sidebar.radio(
-    "Werkzeug",
-    ["Halo Brush", "Restore Brush"],
-)
 
-edge_width = st.sidebar.slider(
-    "Geschützte Randzone",
-    min_value=1,
-    max_value=8,
-    value=3,
-    help=(
-        "Der Halo Brush darf nur innerhalb dieser schmalen Außenkante wirken. "
-        "Das Motivinnere bleibt geschützt."
-    ),
-)
+st.sidebar.header("Cleanup settings")
 
-brush_size = st.sidebar.slider(
-    "Pinselgröße",
-    min_value=5,
-    max_value=120,
-    value=35,
-)
-
-strength_label = st.sidebar.select_slider(
-    "Korrekturstärke",
-    options=["Gentle", "Medium", "Strong"],
+cleanup_strength = st.sidebar.select_slider(
+    "Cleanup strength",
+    options=["Off", "Gentle", "Medium", "Strong"],
     value="Medium",
 )
 
-strength_map = {
-    "Gentle": 0.45,
-    "Medium": 0.72,
-    "Strong": 1.0,
-}
+edge_width = st.sidebar.slider(
+    "Halo width",
+    min_value=1,
+    max_value=6,
+    value=3,
+    help="Only this narrow band along the transparent edge is processed.",
+)
 
-remove_outer_ring = st.sidebar.checkbox(
-    "Äußersten Pixelring unter dem Brush entfernen",
-    value=False,
-    help=(
-        "Nur einschalten, wenn ein fester weißer Rand stehen bleibt. "
-        "Der Brush entfernt dann ausschließlich den äußersten Pixelring."
-    ),
+former_background = st.sidebar.color_picker(
+    "Former background color",
+    "#FFFFFF",
+    help="Choose the background color that was removed before the halo appeared.",
+)
+
+repair_opaque = st.sidebar.checkbox(
+    "Repair solid white/gray fringe",
+    value=True,
+)
+
+remove_weak = st.sidebar.checkbox(
+    "Remove extremely weak outer pixels",
+    value=True,
 )
 
 preview_choice = st.sidebar.selectbox(
-    "Arbeits-Hintergrund",
+    "Preview background",
     ["White", "Light gray", "Dark", "Custom"],
 )
 
@@ -267,148 +297,157 @@ preview_colors = {
 
 if preview_choice == "Custom":
     preview_color = st.sidebar.color_picker(
-        "Eigene Hintergrundfarbe",
-        "#91A9BD",
+        "Custom preview color",
+        "#9FB3C8",
     )
 else:
     preview_color = preview_colors[preview_choice]
 
-uploaded = st.file_uploader(
-    "Transparente PNG hochladen",
-    type=["png"],
+debug_mode = st.sidebar.checkbox(
+    "Developer / Debug mode",
+    value=False,
 )
 
-if uploaded is None:
-    st.info("Lade eine transparente PNG hoch.")
+uploaded_files = st.file_uploader(
+    "Upload one or more transparent PNG files",
+    type=["png"],
+    accept_multiple_files=True,
+)
+
+if not uploaded_files:
+    st.info("Upload a transparent PNG to begin.")
     st.stop()
 
-source = open_rgba(Image.open(uploaded))
+processed_files = []
 
-file_signature = (
-    uploaded.name,
-    source.size,
-)
+for index, uploaded in enumerate(uploaded_files):
+    try:
+        source = Image.open(uploaded)
+        source = ImageOps.exif_transpose(source)
 
-if (
-    "file_signature" not in st.session_state
-    or st.session_state.file_signature != file_signature
-):
-    st.session_state.file_signature = file_signature
-    st.session_state.original_image = source.copy()
-    st.session_state.edited_image = source.copy()
-    st.session_state.canvas_version = 0
-
-original = st.session_state.original_image
-edited = st.session_state.edited_image
-
-editor_background = composite(edited, preview_color)
-editor_background, _ = resize_for_editor(editor_background)
-
-st.markdown(
-    "**Male grob über die störenden weißen oder grauen Ränder.** "
-    "Der Brush korrigiert ausschließlich die geschützte Außenkante."
-)
-
-canvas_result = st_canvas(
-    fill_color="rgba(255, 0, 255, 0.45)",
-    stroke_width=brush_size,
-    stroke_color="rgba(255, 0, 255, 0.95)",
-    background_image=editor_background,
-    update_streamlit=True,
-    height=editor_background.height,
-    width=editor_background.width,
-    drawing_mode="freedraw",
-    key=f"halo_canvas_{st.session_state.canvas_version}",
-)
-
-button_1, button_2, button_3 = st.columns(3)
-
-with button_1:
-    apply_clicked = st.button(
-        "Brush anwenden",
-        type="primary",
-        use_container_width=True,
-    )
-
-with button_2:
-    clear_clicked = st.button(
-        "Pinselstriche löschen",
-        use_container_width=True,
-    )
-
-with button_3:
-    reset_clicked = st.button(
-        "Original wiederherstellen",
-        use_container_width=True,
-    )
-
-if reset_clicked:
-    st.session_state.edited_image = original.copy()
-    st.session_state.canvas_version += 1
-    st.rerun()
-
-if clear_clicked:
-    st.session_state.canvas_version += 1
-    st.rerun()
-
-if apply_clicked:
-    brush_mask = extract_brush_mask(
-        canvas_rgba=canvas_result.image_data,
-        original_size=original.size,
-    )
-
-    if not np.any(brush_mask):
-        st.warning("Male zuerst über einen problematischen Rand.")
-    else:
-        if tool == "Halo Brush":
-            st.session_state.edited_image = apply_halo_brush(
-                image=edited,
-                brush_mask=brush_mask,
-                edge_width=edge_width,
-                strength=strength_map[strength_label],
-                remove_outer_ring=remove_outer_ring,
-            )
-        else:
-            st.session_state.edited_image = restore_brush(
-                edited=edited,
-                original=original,
-                brush_mask=brush_mask,
-            )
-
-        st.session_state.canvas_version += 1
-        st.rerun()
-
-edited = st.session_state.edited_image
-
-st.markdown("### Kontrolle auf vier Hintergründen")
-
-columns = st.columns(4)
-checks = [
-    ("White", "#FFFFFF"),
-    ("Gray", "#BEBEBE"),
-    ("Dark", "#202020"),
-    ("Color", "#91A9BD"),
-]
-
-for column, (label, color) in zip(columns, checks):
-    with column:
-        st.caption(label)
-        st.image(
-            composite(edited, color),
-            use_container_width=True,
+        has_alpha = source.mode in ("RGBA", "LA") or (
+            source.mode == "P" and "transparency" in source.info
         )
 
-output_name = f"{Path(uploaded.name).stem}_halo_studio.png"
+        if not has_alpha:
+            st.error(
+                f"{uploaded.name}: This PNG contains no transparency."
+            )
+            continue
 
-st.download_button(
-    "Bereinigte PNG herunterladen",
-    data=png_bytes(edited),
-    file_name=output_name,
-    mime="image/png",
-    use_container_width=True,
-)
+        cleaned = process_image(
+            image=source,
+            former_background_hex=former_background,
+            cleanup_strength=cleanup_strength,
+            edge_width=edge_width,
+            repair_opaque=repair_opaque,
+            remove_weak=remove_weak,
+        )
+
+        output_name = f"{Path(uploaded.name).stem}_halo_clean.png"
+        processed_files.append((output_name, cleaned))
+
+        st.subheader(uploaded.name)
+
+        before_col, after_col = st.columns(2)
+
+        with before_col:
+            st.markdown("**Before**")
+            st.image(
+                composite_on_color(source, preview_color),
+                use_container_width=True,
+            )
+
+        with after_col:
+            st.markdown("**After**")
+            st.image(
+                composite_on_color(cleaned, preview_color),
+                use_container_width=True,
+            )
+
+        st.download_button(
+            "Download cleaned PNG",
+            data=image_to_png_bytes(cleaned),
+            file_name=output_name,
+            mime="image/png",
+            key=f"download_{index}",
+        )
+
+        with st.expander("Check on four backgrounds"):
+            columns = st.columns(4)
+            checks = [
+                ("White", "#FFFFFF"),
+                ("Gray", "#BEBEBE"),
+                ("Dark", "#202020"),
+                ("Color", "#91A9BD"),
+            ]
+
+            for column, (label, color) in zip(columns, checks):
+                with column:
+                    st.caption(label)
+                    st.image(
+                        composite_on_color(cleaned, color),
+                        use_container_width=True,
+                    )
+
+        if debug_mode:
+            rgba = np.array(open_rgba(source), dtype=np.uint8)
+            alpha = rgba[..., 3]
+
+            st.markdown("### Debug information")
+            st.write(
+                {
+                    "Image mode": source.mode,
+                    "Dimensions": f"{source.width} × {source.height}",
+                    "Transparent pixels": int(np.sum(alpha == 0)),
+                    "Partially transparent pixels": int(
+                        np.sum((alpha > 0) & (alpha < 255))
+                    ),
+                    "Opaque pixels": int(np.sum(alpha == 255)),
+                }
+            )
+
+            debug_cols = st.columns(2)
+
+            with debug_cols[0]:
+                st.markdown("**Alpha channel**")
+                st.image(
+                    alpha_preview(source),
+                    use_container_width=True,
+                )
+
+            with debug_cols[1]:
+                st.markdown("**Processed edge band**")
+                st.image(
+                    edge_preview(source, edge_width),
+                    use_container_width=True,
+                )
+
+        st.divider()
+
+    except Exception as exc:
+        st.error(f"Could not process {uploaded.name}: {exc}")
+
+if len(processed_files) > 1:
+    zip_buffer = io.BytesIO()
+
+    with zipfile.ZipFile(
+        zip_buffer,
+        "w",
+        compression=zipfile.ZIP_DEFLATED,
+    ) as archive:
+        for filename, image in processed_files:
+            archive.writestr(filename, image_to_png_bytes(image))
+
+    st.download_button(
+        "Download all cleaned PNGs as ZIP",
+        data=zip_buffer.getvalue(),
+        file_name="halo_cleaned_pngs.zip",
+        mime="application/zip",
+    )
 
 st.caption(
-    "Empfohlener Start: Randzone 3 px, Medium, Pixelring ausgeschaltet. "
-    "Nur über die sichtbar problematischen Stellen malen."
+    "Recommended starting point for your farm PNG: "
+    "Medium · Halo width 3 · Former background white · "
+    "Repair solid fringe enabled."
 )
