@@ -1,5 +1,0 @@
-streamlit==1.39.0
-streamlit-drawable-canvas==0.9.3
-Pillow==11.3.0
-numpy==1.26.4
-scipy==1.13.1
